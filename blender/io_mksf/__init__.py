@@ -16,6 +16,7 @@ from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import bsp as bspmod
 from . import cdf, disc, entities_blender, level_blender, modapply, skn_blender
+MUSIC = False          # music panel (music_blender.py) is parked: works in the menu, not yet in levels
 from . import skn as sknmod
 from . import txd as txdmod
 
@@ -215,7 +216,10 @@ def level_groups(context, objs):
         if "mksf_collision" in o:
             f = by_dict.get(str(o["mksf_collision"]).lower())
             if f:
-                files[f]["coll"] = o
+                cl = files[f].setdefault("colls", [])
+                main = o.name.lower() == files[f]["dict"].lower() + "_collision"
+                cl.insert(0, o) if main else cl.append(o)
+                files[f]["coll"] = cl[0]
             continue
         for m in o.data.materials:
             if m is not None and "mksf_tex" in m:
@@ -287,23 +291,23 @@ def export_to_disc(context, target, objs, base, report):
                     else:
                         raise ValueError("%s on the target is not the version this .blend was imported from; "
                                          "re-import the level from the target disc" % info["file"])
-                colls_all = [x for x in context.scene.objects
-                             if str(x.get("mksf_collision", "")).lower() == info["dict"].lower()]
+                colls_all = grp.get("colls", [])
                 if len(colls_all) > 1:
-                    report({"WARNING"}, "MKSF: several collision objects for %s (%s); using %s" % (
-                        info["file"], ", ".join(x.name for x in colls_all), grp["coll"].name))
+                    report({"INFO"}, "MKSF: %s: collision from %d objects (%s)" % (
+                        info["file"], len(colls_all), ", ".join(x.name for x in colls_all)))
                 if len(grp["objs"]) > 1:
                     report({"INFO"}, "MKSF: %s: %d objects exported as one level" % (info["file"], len(grp["objs"])))
-                new, upd, add, rem = level_blender.build_bsp(grp["objs"], cur, dg, warn=warn, coll_obj=grp["coll"])
+                new, upd, add, rem = level_blender.build_bsp(grp["objs"], cur, dg, warn=warn, coll_obj=grp.get("colls") or None,
+                    coll_src=lambda i=info: cdf.get(read_sf(i["source"]), i["file"]))
                 assigns.append(level_blender.LAST_ASSIGN)
                 bases_to_set.append((grp["objs"], info["file"]))
-                if grp["coll"] is not None:
-                    colls.append((grp["coll"], info["file"]))
+                if grp.get("colls"):
+                    colls.append((grp["colls"], info["file"]))
                 if exe_data is not None:
                     new = entities_blender.apply_entities(info["file"], new, sf, overlays, exe_data, warn=warn)
                 tname, t = modapply.find_dict(sf, info["dict"])
                 texs, pals = level_blender.texture_edits(o, t, new, log=warn) if t else ({}, {})
-                edits.append(modapply.Edit(info["file"], None if new == cur else new, info["dict"], texs, pals))
+                edits.append(modapply.Edit(info["file"], new, info["dict"], texs, pals))
                 refresh.append((o, info["dict"], level_blender.refresh_images))
                 report({"INFO"}, "MKSF: %s: %d polygons kept, %d added, %d removed; textures %s, palettes %s" % (
                     info["file"], upd, add, rem, sorted(texs) or "-", sorted(pals) or "-"))
@@ -314,20 +318,18 @@ def export_to_disc(context, target, objs, base, report):
             tname, t = modapply.find_dict(sf, name)
             texs, pals = skn_blender.texture_edits(o, t, m, log=warn) if t else ({}, {})
             same = m.same(sknmod.SKN(cdf.get(sf, info["model"] + ".skn")))
-            edits.append(modapply.Edit(info["model"] + ".skn", None if same else m.build(), name, texs, pals))
+            edits.append(modapply.Edit(info["model"] + ".skn", m.build(), name, texs, pals))
             refresh.append((o, name, skn_blender.refresh_images))
             report({"INFO"}, "MKSF: %s: geometry %s, textures %s, palettes %s" % (
                 info["model"], "unchanged" if same else "changed", sorted(texs) or "-", sorted(pals) or "-"))
         for name, ovl in overlays.items():
-            if bytes(ovl.data) != cdf.get(sf, name):
-                edits.append(modapply.Edit(name, bytes(ovl.data)))
-                report({"INFO"}, "MKSF: %s: entities updated" % name)
+            edits.append(modapply.Edit(name, bytes(ovl.data)))
+            report({"INFO"}, "MKSF: %s: entities written%s" % (
+                name, "" if bytes(ovl.data) != cdf.get(sf, name) else " (same as on the disc)"))
         lines = []
         new_sf = modapply.apply(sf, edits, log=lines.append)
-        if new_sf == sf:
-            report({"INFO"}, "MKSF: nothing changed")
-            return
-        d.replace_file("SF.CDF", new_sf, log=lambda s: report({"INFO"}, "MKSF: " + s))
+        report({"INFO"}, "MKSF: SF.CDF rebuilt (%s)" % ("same as on the disc" if new_sf == sf else "changed"))
+        d.replace_file("SF.CDF", new_sf, log=lambda s: report({"INFO"}, "MKSF: " + s), only_changed=False)
     finally:
         d.close()
     d = disc.Disc(target)
@@ -457,13 +459,22 @@ class MKSF_OT_object_collision(bpy.types.Operator):
                 return {"CANCELLED"}
             mwc = co.matrix_world
             existing = set()
-            for p in co.data.polygons:
-                existing.add(tuple(sorted(tuple(round(c) for c in (mwc @ co.data.vertices[i].co) * 100)
-                                          for i in p.vertices)))
+            for x in g.get("colls") or [co]:
+                mwx = x.matrix_world
+                kinds = x.data.attributes.get("mksf_ckind")
+                for p in x.data.polygons:
+                    if kinds is not None and kinds.data[p.index].value == 5:
+                        continue                           # camera zones are not solid
+                    existing.add(tuple(sorted(tuple(round(c) for c in (mwx @ x.data.vertices[i].co) * 100)
+                                              for i in p.vertices)))
+            level_blender.ensure_coll_materials(co.data)
             bm = bmesh.new()
             bm.from_mesh(co.data)
             cq = bm.faces.layers.int.get("mksf_cq") or bm.faces.layers.int.new("mksf_cq")
             ct = bm.faces.layers.int.get("mksf_ct") or bm.faces.layers.int.new("mksf_ct")
+            L = bm.faces.layers.int
+            layers = tuple(L.get(n) or L.new(n) for n in ("mksf_ca", "mksf_ct", "mksf_ckind"))
+            mark = context.scene.mksf_mark
             inv = mwc.inverted()
             for o in sel:
                 if o not in g["objs"]:
@@ -486,6 +497,9 @@ class MKSF_OT_object_collision(bpy.types.Operator):
                         continue
                     nf[cq] = 0
                     nf[ct] = 2 if n.z > 0.7 else 1
+                    nf[layers[0]] = 0
+                    if mark_face(nf, layers, mark, n, _face_width(world)) == "not a wall":
+                        mark_face(nf, layers, "SOLID", n, 0)
                     added += 1
             bm.to_mesh(co.data)
             bm.free()
@@ -495,6 +509,81 @@ class MKSF_OT_object_collision(bpy.types.Operator):
                 added, " (%d already had collision)" % skipped if skipped else ""))
         else:
             self.report({"WARNING"}, "MKSF: collision already exists here (%d faces), nothing added" % skipped)
+        return {"FINISHED"}
+
+def mark_items(self, context):
+    return [(m[0], m[1], m[2]) for m in level_blender.COLL_MARKS]
+
+def mark_face(bm_face, layers, mark, world_normal, width):
+    """Apply a COLL_MARKS entry to a collision bmesh face; return an error text or None."""
+    ca, ct, ck = layers
+    m = next(x for x in level_blender.COLL_MARKS if x[0] == mark)
+    tab = bm_face[ct] or (2 if world_normal.z > 0.7 else 1)
+    a = bm_face[ca]
+    if mark == "LADDER":
+        if abs(world_normal.z) > 0.3 or tab != 1:
+            return "not a wall"
+        a |= 0x2
+    else:
+        a &= ~0x2
+    bm_face[ca] = a
+    if m[4] is not None:
+        kind = m[4]
+    elif bm_face[ck] in (0, 1, 2):                 # other special kinds (zones, cameras) are kept
+        kind = tab - 1
+    else:
+        kind = bm_face[ck]
+    bm_face[ck] = kind
+    bm_face.material_index = kind
+    if mark == "LADDER" and width < 96:
+        return "narrow"
+    return None
+
+def _face_width(world):
+    xs = [w.x for w in world]
+    ys = [w.y for w in world]
+    return ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5 / skn_blender.SCALE
+
+class MKSF_OT_mark_collision(bpy.types.Operator):
+    """Give the selected faces of the collision object a type (Mark as)"""
+    bl_idname = "mksf.mark_collision"
+    bl_label = "Mark selected faces"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mark: EnumProperty(name="Mark as", items=mark_items)
+
+    @classmethod
+    def poll(cls, context):
+        o = context.active_object
+        return o is not None and "mksf_collision" in o and o.mode == "EDIT"
+
+    def execute(self, context):
+        import bmesh
+        o = context.active_object
+        level_blender.ensure_coll_materials(o.data)
+        bm = bmesh.from_edit_mesh(o.data)
+        L = bm.faces.layers.int
+        layers = tuple(L.get(n) or L.new(n) for n in ("mksf_ca", "mksf_ct", "mksf_ckind"))
+        mw = o.matrix_world
+        nm = mw.to_3x3()
+        done, bad, narrow = 0, 0, 0
+        for f in bm.faces:
+            if not f.select:
+                continue
+            err = mark_face(f, layers, self.mark, (nm @ f.normal).normalized(),
+                            _face_width([mw @ v.co for v in f.verts]))
+            if err == "not a wall":
+                bad += 1
+                continue
+            narrow += err == "narrow"
+            done += 1
+        bmesh.update_edit_mesh(o.data)
+        msg = "MKSF: %d faces marked as %s" % (done, self.mark.lower())
+        if bad:
+            msg += "; %d skipped (a ladder must be a wall)" % bad
+        if narrow:
+            msg += "; %d narrower than ~100 units (the player may not grab them)" % narrow
+        self.report({"WARNING"} if bad or narrow else {"INFO"}, msg)
         return {"FINISHED"}
 
 class MKSF_PT_panel(bpy.types.Panel):
@@ -508,9 +597,15 @@ class MKSF_PT_panel(bpy.types.Panel):
         lay.operator(IMPORT_SCENE_OT_mksf.bl_idname, icon="IMPORT")
         lay.operator(IMPORT_SCENE_OT_mksf_level.bl_idname, icon="IMPORT")
         lay.operator(EXPORT_SCENE_OT_mksf_disc.bl_idname, icon="DISC")
-        if plain_selection(context):
-            lay.operator(MKSF_OT_object_collision.bl_idname, icon="MOD_PHYSICS")
         o = context.active_object
+        coll_edit = o is not None and "mksf_collision" in o and o.mode == "EDIT"
+        if plain_selection(context) or coll_edit:
+            box = lay.box()
+            box.prop(context.scene, "mksf_mark")
+            if plain_selection(context):
+                box.operator(MKSF_OT_object_collision.bl_idname, icon="MOD_PHYSICS")
+            if coll_edit:
+                box.operator(MKSF_OT_mark_collision.bl_idname, icon="CHECKMARK").mark = context.scene.mksf_mark
         if o is None or "mksf" not in o:
             return
         info = skn_blender.info_of(o)
@@ -538,11 +633,17 @@ def menu_export(self, context):
     self.layout.operator(EXPORT_SCENE_OT_mksf_disc.bl_idname, text="MKSF models/levels to disc image (.bin)")
     self.layout.operator(EXPORT_SCENE_OT_mksf_skn.bl_idname, text="MKSF model (.skn)")
 
-classes = (MKSF_OT_object_collision, MKSF_OT_pick, IMPORT_SCENE_OT_mksf, IMPORT_SCENE_OT_mksf_level, EXPORT_SCENE_OT_mksf_disc, EXPORT_SCENE_OT_mksf_skn, MKSF_PT_panel)
+classes = (MKSF_OT_object_collision, MKSF_OT_mark_collision, MKSF_OT_pick, IMPORT_SCENE_OT_mksf, IMPORT_SCENE_OT_mksf_level, EXPORT_SCENE_OT_mksf_disc, EXPORT_SCENE_OT_mksf_skn, MKSF_PT_panel)
 
 def register():
     for c in classes:
         bpy.utils.register_class(c)
+    if MUSIC:
+        from . import music_blender
+        music_blender.register()
+    bpy.types.Scene.mksf_mark = EnumProperty(
+        name="Mark as", items=mark_items,
+        description="Type given to collision faces by Create object collision and Mark selected faces")
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_export)
     bpy.app.handlers.save_pre.append(pack_dirty_images)
@@ -552,5 +653,9 @@ def unregister():
         bpy.app.handlers.save_pre.remove(pack_dirty_images)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
+    del bpy.types.Scene.mksf_mark
+    if MUSIC:
+        from . import music_blender
+        music_blender.unregister()
     for c in reversed(classes):
         bpy.utils.unregister_class(c)

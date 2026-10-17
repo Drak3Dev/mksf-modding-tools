@@ -19,6 +19,10 @@ and written straight back into the game's disc image.
 
 </div>
 
+> [!WARNING]
+> **Very early alpha — bugs are expected.** The game's engine is touchy: small changes can break things in
+> unexpected ways. Always work on a copy of your disc image (the tools never write to the original) and test often.
+
 ---
 
 ## What it does
@@ -28,7 +32,7 @@ and written straight back into the game's disc image.
 | **Characters** | Import any of the ~100 character models (`.skn`) with their real textures and palettes; edit geometry, UVs, body parts and textures; export. Every copy of the model on the disc (up to 18 of them) and every level texture dictionary is updated. |
 | **Play as anyone** | `tools/swap_player.py` turns any character into the player model — e.g. play as **Jarek**. Animations keep working. |
 | **Levels** | Import a level (`.bsp`) with textures, UVs and baked vertex lighting. Move, delete and add geometry — the BSP tree, leaf ranges, bounding spheres and zones are rebuilt; large faces are cut into tiles so the PS1 does not drop them. |
-| **Collision** | The level's collision is a separate editable object. Delete, move or add faces; **Create object collision** makes any object solid. |
+| **Collision** | The level's collision is a separate editable object (or several), coloured by type: walls, floors, ladders, pushable boxes, doors/lifts, camera zones. Delete, move or add faces; **Create object collision** makes any object solid; **Mark as → Ladder** makes walls climbable. Moving a whole ladder or box moves its group with it. |
 | **Enemies & items** | Enemies (real models), patrol routes (curves), pickups, lights and the player start are editable objects. Change positions, enemy types (incl. bosses), routes, items, light colours. |
 | **Textures** | Paint in Blender or replace images; palettes are rebuilt when it is safe, otherwise colours snap to the existing palette. Edited images are packed into the `.blend` automatically. |
 | **Disc images** | Reads `.cue`/`.bin` directly. Exports into a *copy* of the disc (created on first export), updating it in place on later exports; only changed sectors are rewritten, EDC/ECC fixed, everything verified by reading back. Original images are never written to. |

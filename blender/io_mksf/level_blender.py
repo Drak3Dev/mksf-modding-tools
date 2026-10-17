@@ -294,7 +294,7 @@ def _mesh_faces(obj, depsgraph):
         ev.to_mesh_clear()
     return out
 
-def build_bsp(objs, data, depsgraph, warn=print, coll_obj=None):
+def build_bsp(objs, data, depsgraph, warn=print, coll_obj=None, coll_src=None):
     """New .bsp bytes from all objects of one level (level objects, separated parts, plain meshes with
     the level's materials), based on the level's current file data."""
     info = info_of(objs[0]) if "mksf_level" in objs[0] else None
@@ -422,7 +422,7 @@ def build_bsp(objs, data, depsgraph, warn=print, coll_obj=None):
 
     walls, floors = [], []
     if coll_obj is not None:
-        cw, cf = apply_collision_object(b, coll_obj, depsgraph, nodes)
+        cw, cf = apply_collision_object(b, coll_obj, depsgraph, nodes, warn=warn, src=coll_src)
         walls += cw
         floors += cf
     if walls or floors:
@@ -487,106 +487,326 @@ def _coll_entry(b, nodes, pts, bn):
 
 # ---------------------------------------------------------------------------
 # Collision object: faces = the level's collision quads (C1 walls, C2 floors).
-# Face attributes mksf_cq = quad index + 1 (0 = new face), mksf_ct = 1 walls / 2 floors.
+# Face attributes mksf_cq = quad index + 1 (0 = new face), mksf_ct = 1 walls / 2 floors, mksf_cg group,
+# mksf_cl 1 = stored in the group's local space, mksf_ca / mksf_cf / mksf_cb / mksf_cc the game's fields
+# (read only, kept on export), mksf_ckind = COLL_TYPES index.
 # ---------------------------------------------------------------------------
 
-def collision_mesh(name, b):
+COLL_TYPES = [   # (name, colour); face attribute mksf_ckind = index
+    ("wall", (0.9, 0.25, 0.15, 0.35)),
+    ("floor", (0.2, 0.75, 0.25, 0.35)),
+    ("ladder", (1.0, 0.85, 0.1, 0.6)),          # wall, a & 2: climbable (FUN_80048AA0 & co.)
+    ("crate", (1.0, 0.5, 0.0, 0.6)),            # wall, a & 0x80: pushable box, moved through its zone
+    ("zone", (0.2, 0.5, 1.0, 0.6)),             # a & 0x100, floor a & 0x8000: door, lift, moving part
+    ("camera", (0.3, 0.9, 0.9, 0.25)),          # floor, flags & 8: original camera zone, b = camera id; not solid
+    ("special", (0.75, 0.3, 1.0, 0.6)),         # anything else unusual
+]
+
+# what "Mark as" can set on a collision face: (id, label, description, bits of a, kind)
+COLL_MARKS = [
+    ("SOLID", "Solid", "Plain collision: wall or floor by the face direction", 0, None),
+    ("LADDER", "Ladder", "Climbable wall: vertical face, at least ~100 units wide, facing the player; "
+     "the climb ends at its top edge (put a floor there)", 0x2, 2),
+]
+
+def coll_kind(tab, a, flags, c):
+    if tab == 2 and flags & 0x8:
+        return 5
+    if tab == 2 and a & 0x8000:
+        return 4                                   # floor of zone a & 0xFF
+    if tab == 1 and a & 0x2:
+        return 2
+    if tab == 1 and a & 0x80:
+        return 3
+    if a & 0x100:
+        return 4
+    if tab == 1 and (a or flags & 0x0FFF or c not in (0, 116, 209)):
+        return 6
+    if tab == 2 and (a & ~0xF or flags & 0x0FFF):    # low bits of a on floors = surface type
+        return 6
+    return 0 if tab == 1 else 1
+
+def ensure_coll_materials(me):
+    """Give a collision mesh the per-kind materials (older .blend files had a single one)."""
+    names = ["MKSF " + k for k, _ in COLL_TYPES]
+    if [m.name if m else None for m in me.materials] == names:
+        return
+    me.materials.clear()
+    for kname, colour in COLL_TYPES:
+        mat = bpy.data.materials.get("MKSF " + kname) or bpy.data.materials.new("MKSF " + kname)
+        mat.diffuse_color = colour
+        me.materials.append(mat)
+    kinds = me.attributes.get("mksf_ckind")
+    ct = me.attributes.get("mksf_ct")
+    for p in me.polygons:
+        if kinds is not None:
+            p.material_index = kinds.data[p.index].value
+        elif ct is not None:
+            p.material_index = max(0, ct.data[p.index].value - 1)
+
+def collision_quads(b):
+    """Every quad: dict(tab, idx, group, M, T, stored, world, local, a, flags, b, c)."""
     lay = bspmod._tail_layout(b.tail)
-    verts, faces, cq, ct = [], [], [], []
-    for t, tab in ((1, "C1"), (2, "C2")):
-        o, n, size = lay[tab]
-        for i in range(n):
-            v = struct.unpack_from("<16h", b.tail, o + 4 + i * size)
-            pts = [v[k * 4:k * 4 + 3] for k in range(4)]
-            uniq = []
-            for p in pts:
-                if p not in uniq:
-                    uniq.append(p)
-            if len(uniq) < 3:
-                continue
-            faces.append(list(range(len(verts), len(verts) + len(uniq))))
-            verts += [to_blender(*p) for p in uniq]
-            cq.append(i + 1)
-            ct.append(t)
+    t = b.tail
+    out = []
+    for tab, cn, gn in ((1, "C1", "G1"), (2, "C2", "G2")):
+        co = lay[cn][0] + 4
+        go, gc, _ = lay[gn]
+        cum = 0
+        for g in range(gc):
+            e = t[go + 4 + g * 84:go + 4 + g * 84 + 84]
+            M = struct.unpack_from("<9h", e, 0)
+            T = struct.unpack_from("<3i", e, 20)
+            cnt = struct.unpack_from("<i", e, 40)[0]
+            for i in range(cum, cum + cnt):
+                v = struct.unpack_from("<16h4h4h", t, co + i * 48)
+                P = [v[k * 4:k * 4 + 3] for k in range(4)]
+                n, d = v[16:19], v[19]
+                W = [tuple(round((M[r * 3] * p[0] + M[r * 3 + 1] * p[1] + M[r * 3 + 2] * p[2]) / 4096.0 + T[r])
+                           for r in range(3)) for p in P]
+                # FUN_8002b720: without flag 0x8000 the corners go through the group's matrix and translation;
+                # the plane is always in world space
+                local = not v[21] & 0x8000
+                out.append(dict(tab=tab, idx=i, group=g, M=M, T=T, stored=P, world=W if local else P, local=local,
+                                a=v[20] & 0xFFFF, flags=v[21] & 0xFFFF, b=v[22], c=v[23]))
+            cum += cnt
+    return out
+
+def collision_mesh(name, b, only=None, exclude=()):
+    verts, faces, attrs = [], [], {k: [] for k in ("mksf_cq", "mksf_ct", "mksf_cg", "mksf_cl", "mksf_ca",
+                                                   "mksf_cf", "mksf_cb", "mksf_cc", "mksf_ckind")}
+    for q in collision_quads(b):
+        if (only is not None and (q["tab"], q["idx"]) not in only) or (q["tab"], q["idx"]) in exclude:
+            continue
+        uniq = []
+        for p in q["world"]:
+            if tuple(p) not in uniq:
+                uniq.append(tuple(p))
+        if len(uniq) < 3:
+            continue
+        faces.append(list(range(len(verts), len(verts) + len(uniq))))
+        verts += [to_blender(*p) for p in uniq]
+        kind = coll_kind(q["tab"], q["a"], q["flags"], q["c"])
+        for k, v in (("mksf_cq", q["idx"] + 1), ("mksf_ct", q["tab"]), ("mksf_cg", q["group"]),
+                     ("mksf_cl", int(q["local"])), ("mksf_ca", q["a"]), ("mksf_cf", q["flags"] & 0x0FFF),
+                     ("mksf_cb", q["b"]), ("mksf_cc", q["c"]), ("mksf_ckind", kind)):
+            attrs[k].append(v)
     me = bpy.data.meshes.new(name + "_collision")
     me.from_pydata(verts, [], faces)
     me.update()
-    a = me.attributes.new("mksf_cq", "INT", "FACE")
-    a.data.foreach_set("value", np.array(cq, dtype=np.int32))
-    a = me.attributes.new("mksf_ct", "INT", "FACE")
-    a.data.foreach_set("value", np.array(ct, dtype=np.int32))
-    mat = bpy.data.materials.get("MKSF collision") or bpy.data.materials.new("MKSF collision")
-    mat.diffuse_color = (1.0, 0.2, 0.1, 0.35)
-    me.materials.append(mat)
+    for k, vals in attrs.items():
+        a = me.attributes.new(k, "INT", "FACE")
+        a.data.foreach_set("value", np.array(vals, dtype=np.int32))
+    ensure_coll_materials(me)
     return me
 
-def refresh_collision(obj, b):
-    """Replace the collision object's mesh with what the .bsp now contains."""
-    old = obj.data
-    obj.data = collision_mesh(obj["mksf_collision"], b)
-    obj.matrix_world.identity()
-    if old.users == 0:
-        bpy.data.meshes.remove(old)
+def refresh_collision(objs, b):
+    """Replace the collision objects' meshes with what the .bsp now contains: extra objects keep their own
+    quads (as of the last export), the main one gets everything else."""
+    if not isinstance(objs, (list, tuple)):
+        objs = [objs]
+    claimed = set()
+    for obj in objs[1:]:
+        claimed |= LAST_COLL_OWNERS.get(obj.name, set())
+    for i, obj in enumerate(objs):
+        old = obj.data
+        if i == 0:
+            obj.data = collision_mesh(obj["mksf_collision"], b, exclude=claimed)
+        else:
+            obj.data = collision_mesh(obj["mksf_collision"], b, only=LAST_COLL_OWNERS.get(obj.name, set()))
+            obj.data.name = obj.name
+        obj.matrix_world.identity()
+        if old.users == 0:
+            bpy.data.meshes.remove(old)
 
 def build_collision(name, b, parent_coll=None):
     me = collision_mesh(name, b)
     obj = bpy.data.objects.new(name + "_collision", me)
     obj["mksf_collision"] = name
-    obj.display_type = "WIRE"
+    obj.display_type = "SOLID"
+    obj.show_wire = True
     obj.hide_render = True
     (parent_coll or bpy.context.scene.collection).objects.link(obj)
     return obj
 
-def apply_collision_object(b, obj, depsgraph, nodes):
-    """Update/remove existing quads from the collision object; return new (walls, floors) entries."""
-    lay = bspmod._tail_layout(b.tail)
-    t = bytearray(b.tail)
+def _shift_quad(t, o, q, d):
+    """Translate the stored quad at t[o] by world offset d, keeping its normal, side and special fields."""
+    v = list(struct.unpack_from("<16h4h", t, o))
+    if q["local"]:
+        M = q["M"]
+        ld = [round((M[0 * 3 + j] * d[0] + M[1 * 3 + j] * d[1] + M[2 * 3 + j] * d[2]) / 4096.0) for j in range(3)]
+    else:
+        ld = d
+    for k in range(4):
+        for j in range(3):
+            v[k * 4 + j] += ld[j]
+    n = v[16:19]
+    v[19] -= round(sum(n[j] * d[j] for j in range(3)) / 4096.0)
+    flags = struct.unpack_from("<H", t, o + 42)[0]
+    ax = {4: 0, 2: 1, 1: 2}.get((flags >> 12) & 7) if flags & 0x8000 else None
+    if ax is not None:                                     # axis-aligned: w = 2D box in the other axes
+        ab = [k for k in range(3) if k != ax]
+        for slot, axis in ((0, ab[0]), (1, ab[1]), (2, ab[0]), (3, ab[1])):
+            v[slot * 4 + 3] += ld[axis]
+    struct.pack_into("<16h4h", t, o, *v)
+
+LAST_COLL_OWNERS = {}    # extra collision object name -> quad keys it held at the last export
+
+def _coll_faces(obj, depsgraph):
+    """[(pts, world normal, (tab, idx), a or -1)] of a collision object."""
     ev = obj.evaluated_get(depsgraph)
     me = ev.to_mesh()
-    walls, floors = [], []
     try:
         mw = obj.matrix_world
         nm = mw.to_3x3()
-        cq = np.zeros(len(me.polygons), dtype=np.int32)
-        ct = np.zeros(len(me.polygons), dtype=np.int32)
+        n = len(me.polygons)
+        cq = np.zeros(n, dtype=np.int32)
+        ct = np.zeros(n, dtype=np.int32)
+        ca = np.full(n, -1, dtype=np.int32)
         if me.attributes.get("mksf_cq") is not None:
             me.attributes["mksf_cq"].data.foreach_get("value", cq)
             me.attributes["mksf_ct"].data.foreach_get("value", ct)
-        seen = {1: set(), 2: set()}
+        if me.attributes.get("mksf_ca") is not None:
+            me.attributes["mksf_ca"].data.foreach_get("value", ca)
+        out = []
         for p in me.polygons:
             pts = [from_blender(mw @ me.vertices[i].co) for i in p.vertices]
-            bn = (nm @ p.normal).normalized()
-            idx, tab = int(cq[p.index]) - 1, int(ct[p.index])
-            if idx >= 0 and tab in (1, 2) and idx not in seen[tab] and len(pts) in (3, 4):
-                seen[tab].add(idx)
-                o = lay["C%d" % tab][0] + 4 + idx * 48
-                v = struct.unpack_from("<16h", t, o)
-                old = [v[k * 4:k * 4 + 3] for k in range(4)]
-                cur = pts + [pts[-1]] * (4 - len(pts))
-                if set(map(tuple, cur)) != set(map(tuple, old)):
-                    e = _coll_entry(b, nodes, pts, bn) or (bspmod.collision_quad(pts[::-1], (-bn.x, bn.z, -bn.y), True), set(), False)
-                    t[o:o + 32] = e[0][:32]          # corners
-                    t[o + 32:o + 40] = e[0][32:40]   # plane
-                    struct.pack_into("<h", t, o + 42, struct.unpack_from("<h", e[0], 42)[0])   # flags
-                continue
             if len(pts) not in (3, 4):
                 raise ValueError("%s: collision faces must be triangles or quads" % obj.name)
-            e = _coll_entry(b, nodes, pts, bn)
-            if e:
-                (floors if e[2] else walls).append(e[:2])
-        for tab in (1, 2):
-            o0, n, _ = lay["C%d" % tab]
-            for i in range(n):
-                if i in seen[tab]:
-                    continue
-                o = o0 + 4 + i * 48
-                v = struct.unpack_from("<16h", t, o)
-                if len({v[k * 4:k * 4 + 3] for k in range(4)}) < 3:
-                    continue                       # already degenerate in the game data
-                x, y, z = v[0:3]
-                struct.pack_into("<16h", t, o, *([x, y, z, 0] * 4))   # removed: zero size, never hit
+            out.append((pts, (nm @ p.normal).normalized(), (int(ct[p.index]), int(cq[p.index]) - 1),
+                        int(ca[p.index])))
+        return out
     finally:
         ev.to_mesh_clear()
+
+def apply_collision_object(b, objs, depsgraph, nodes, warn=print, src=None):
+    """Update/remove existing quads from the collision object(s) of a level; return new (walls, floors) entries.
+    A group whose quads were all moved by the same offset (a ladder, a box) moves as a whole: its
+    translation follows, local quads keep their local coordinates. Special fields are kept.
+    src: callable returning the level's .bsp bytes from the import source; quads that were wiped on the
+    target (zero size) but still exist in the Blender object are copied back from it unchanged."""
+    if not isinstance(objs, (list, tuple)):
+        objs = [objs]
+    quads = {(q["tab"], q["idx"]): q for q in collision_quads(b)}
+    lay = bspmod._tail_layout(b.tail)
+    t = bytearray(b.tail)
+    walls, floors = [], []
+    LAST_COLL_OWNERS.clear()
+    src_quads, revived = None, 0
+    marks = {}
+    seen = {}
+    for oi, obj in enumerate(objs):
+        for pts, bn, key, a in _coll_faces(obj, depsgraph):
+            if key in quads and key not in seen:
+                seen[key] = (pts, bn)
+                if oi:
+                    LAST_COLL_OWNERS.setdefault(obj.name, set()).add(key)
+                if a >= 0 and (a & 0xFFFF) != quads[key]["a"]:
+                    marks[key] = a & 0xFFFF
+                continue
+            e = _coll_entry(b, nodes, pts, bn)
+            if e:
+                if not e[2] and a > 0 and a & 0x2:
+                    entry = bytearray(e[0])
+                    struct.pack_into("<h", entry, 40, 0x2)          # ladder
+                    e = (bytes(entry),) + tuple(e[1:])
+                (floors if e[2] else walls).append(e[:2])
+
+    # whole groups moved by one offset
+    by_group = {}
+    for key, q in quads.items():
+        by_group.setdefault((q["tab"], q["group"]), []).append(key)
+    moved_groups = {}
+    for gk, keys in by_group.items():
+        q0 = quads[keys[0]]
+        if q0["M"] == (4096, 0, 0, 0, 4096, 0, 0, 0, 4096) and q0["T"] == (0, 0, 0):
+            continue                                   # plain static geometry
+        deltas = set()
+        for key in keys:
+            if key not in seen:
+                deltas = None
+                break
+            old = [tuple(x) for x in quads[key]["world"]]
+            new = seen[key][0]
+            old_u = sorted(set(old))
+            new_u = sorted(set(map(tuple, new)))
+            if len(old_u) != len(new_u):
+                deltas = None
+                break
+            ds = {tuple(nn[k] - oo[k] for k in range(3)) for oo, nn in zip(old_u, new_u)}
+            deltas |= ds
+        if deltas and len(deltas) == 1:
+            d = next(iter(deltas))
+            if d != (0, 0, 0):
+                moved_groups[gk] = d
+
+    for (tab, g), d in moved_groups.items():
+        go = lay["G%d" % tab][0] + 4 + g * 84
+        T = struct.unpack_from("<3i", t, go + 20)
+        struct.pack_into("<3i", t, go + 20, *(T[k] + d[k] for k in range(3)))
+    if moved_groups:
+        warn("%d collision objects (ladders, boxes...) moved as a whole" % len(moved_groups))
+
+    for key, (pts, bn) in seen.items():
+        q = quads[key]
+        o = lay["C%d" % q["tab"]][0] + 4 + q["idx"] * 48
+        cur = pts + [pts[-1]] * (4 - len(pts))
+        if set(map(tuple, cur)) == set(map(tuple, q["world"])):
+            continue
+        if len(set(map(tuple, q["stored"]))) < 3 and src is not None:
+            if src_quads is None:
+                try:
+                    sb = bspmod.BSP(src())
+                    src_quads = {(x["tab"], x["idx"]): (x, sb) for x in collision_quads(sb)}
+                except Exception as e:
+                    warn("cannot read the original collision (%s)" % e)
+                    src_quads = {}
+            sq = src_quads.get(key)
+            if sq and set(map(tuple, cur)) == set(map(tuple, sq[0]["world"])):
+                so = bspmod._tail_layout(sq[1].tail)["C%d" % q["tab"]][0] + 4 + q["idx"] * 48
+                t[o:o + 48] = sq[1].tail[so:so + 48]
+                revived += 1
+                continue
+        gk = (q["tab"], q["group"])
+        if q["local"] and gk in moved_groups:
+            gd = moved_groups[gk]                      # corners ride on the group translation,
+            n = struct.unpack_from("<3h", t, o + 32)   # the world plane moves with them
+            dd = struct.unpack_from("<h", t, o + 38)[0]
+            struct.pack_into("<h", t, o + 38, dd - round(sum(n[j] * gd[j] for j in range(3)) / 4096.0))
+            continue
+        old_u = sorted(set(map(tuple, q["world"])))
+        new_u = sorted(set(map(tuple, cur)))
+        d = tuple(new_u[0][k] - old_u[0][k] for k in range(3))
+        if len(old_u) == len(new_u) and all(tuple(o_[k] + d[k] for k in range(3)) == n_
+                                            for o_, n_ in zip(old_u, new_u)):
+            _shift_quad(t, o, q, d)                    # moved as is: keep the game's own entry
+            continue
+        e = _coll_entry(b, nodes, pts, bn) or (bspmod.collision_quad(pts[::-1], (-bn.x, bn.z, -bn.y), True), set(), False)
+        entry = bytearray(e[0])
+        on = struct.unpack_from("<3h", t, o + 32)
+        nn = struct.unpack_from("<4h", entry, 32)
+        if sum(on[k] * nn[k] for k in range(3)) < 0:   # keep the side the game expects
+            struct.pack_into("<4h", entry, 32, *(-v for v in nn))
+        t[o:o + 40] = entry[:40]                       # reshaped: stored in world space from now on
+        old_flags = struct.unpack_from("<H", t, o + 42)[0]
+        new_flags = struct.unpack_from("<H", entry, 42)[0]
+        struct.pack_into("<H", t, o + 42, (new_flags & 0xF000) | (old_flags & 0x0FFF))
+    if revived:
+        warn("%d collision quads wiped by an earlier export were restored from the original" % revived)
+    for key, a in marks.items():
+        o = lay["C%d" % quads[key]["tab"]][0] + 4 + quads[key]["idx"] * 48
+        struct.pack_into("<H", t, o + 40, a)
+    if marks:
+        warn("%d collision faces got a new type" % len(marks))
+    for key, q in quads.items():
+        if key in seen:
+            continue
+        o = lay["C%d" % q["tab"]][0] + 4 + q["idx"] * 48
+        v = struct.unpack_from("<16h", t, o)
+        if len({v[k * 4:k * 4 + 3] for k in range(4)}) < 3:
+            continue                                   # already degenerate in the game data
+        x, y, z = v[0:3]
+        struct.pack_into("<16h", t, o, *([x, y, z, 0] * 4))   # removed: zero size, never hit
     b.tail = bytes(t)
     return walls, floors
 

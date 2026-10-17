@@ -179,7 +179,7 @@ class Disc:
             self.file.seek((lba + i) * SECTOR_RAW)
             self.file.write(sec)
 
-    def replace_file(self, path, data, pad_file="JUNK.PAD", log=print):
+    def replace_file(self, path, data, pad_file="JUNK.PAD", log=print, only_changed=True):
         """Replace a file's contents. Stays in place if it fits before the next file on the disc,
         otherwise moves to the start of pad_file (which shrinks)."""
         e = self.find(path)
@@ -191,12 +191,12 @@ class Disc:
                 sectors > nxt - e.lba and sectors <= nxt - e.lba + nxt_entry.size // SECTOR_DATA:
             grow = sectors - (nxt - e.lba)                # take sectors from the pad right after the file
             self.set_entry(nxt_entry, lba=nxt_entry.lba + grow, size=nxt_entry.size - grow * SECTOR_DATA)
-            self.write_form1(e.lba, data, only_changed=True)
+            self.write_form1(e.lba, data, only_changed=only_changed)
             self.set_entry(e, size=len(data))
             log("%s: grew in place at LBA %d into %s (+%d sectors)" % (path, e.lba, pad_file, grow))
             return
         if sectors <= nxt - e.lba:
-            self.write_form1(e.lba, data, only_changed=True)
+            self.write_form1(e.lba, data, only_changed=only_changed)
             self.set_entry(e, size=len(data))
             log("%s: written in place at LBA %d (%d of %d sectors)" % (path, e.lba, sectors, nxt - e.lba))
             return

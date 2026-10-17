@@ -79,6 +79,16 @@ Large polygons close to the camera are dropped by the renderer — original geom
   `4 × {x, y, z, w}`, `nx, ny, nz, d`, `a, flags, b, c` (int16).
   Axis-aligned: `flags = 0x8000 | axis << 12` (x 4, y 2, z 1), `w` = 2D bounding box in the two other axes
   (min a, min b, max a, max b). Slanted: `flags = 0x8000`, `w = (axis code 1/2/4, 0, 0, 0)`. Tested double-sided.
+* Special fields (`a` @+40, `flags` @+42, `b` @+44, `c` @+46; the game reads `a | flags << 16`):
+  * `flags & 0x8000` clear: the corners are in the group's local space and go through its matrix and translation
+    (`FUN_8002B720`, GTE); `w` of corner 0 is then the projection axis code. The plane is always in world space.
+  * walls `a & 2` — **ladder**: the player probes ±40 sideways / 35 ahead, both must hit such a quad; the climb ends
+    at the quad's top edge. Any vertical wall ≥ ~100 wide works, the group does not matter.
+  * walls `a & 0x80` — pushable box (moves its group and zone); floors `a & 0x80` — box top.
+  * `a & 0x100` — part of a door / lift: the group follows its zone at run time.
+  * floors: `a & 0xF` surface type, `a & 8` platform, `a & 0x8000` floor of zone `a & 0xFF`; `flags & 8` —
+    **camera zone** of the original camera (`b` = camera setting), not solid. The player skips `0x88000`.
+  * Climbing onto a ledge (triangle) needs no flag: a wall in front and a floor within reach of both hands.
 * `G1`, `G2` — groups of C1 / C2 quads, `int32 count` + 84 bytes: matrix, …, quad count @+40, object id @+80
   (ids unique across G1+G2). A group's quads follow the previous groups' quads.
 * Lights — `int32 count` + 24 bytes: `int32 x, y, z; uint32 0x00BBGGRR; int16 intensity, ?, ?, radius`.
