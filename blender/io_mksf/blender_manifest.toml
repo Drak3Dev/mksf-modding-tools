@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "io_mksf"
+version = "0.2.0"
+name = "Mortal Kombat: Special Forces (PS1)"
+tagline = "Characters, levels, collision and enemies of MKSF (PS1)"
+maintainer = "Drak3Dev"
+website = "https://github.com/Drak3Dev/mksf-modding-tools"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Import-Export"]
+
+[permissions]
+files = "Read PS1 disc images and write mod disc images"
