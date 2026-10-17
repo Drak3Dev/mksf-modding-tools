@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "io_mksf"
-version = "0.2.0"
+version = "0.2.1"
 name = "Mortal Kombat: Special Forces (PS1)"
 tagline = "Characters, levels, collision and enemies of MKSF (PS1)"
 maintainer = "Drak3Dev"

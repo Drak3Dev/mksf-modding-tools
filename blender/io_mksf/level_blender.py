@@ -356,6 +356,11 @@ def build_bsp(objs, data, depsgraph, warn=print, coll_obj=None):
                 q0 = b.polys[pid]
                 cs = [corner[(cmap >> (2 * k)) & 3] for k in range(4)]
                 cs = [(c[0], c[1], c[2], c[3] if c[3] is not None else q0.colors[k] & 0xFFFFFF) for k, c in enumerate(cs)]
+                # A corner that repeats another one (triangles) keeps its own original UV and colour.
+                oc = q0.corners()
+                slots = [(cmap >> (2 * k)) & 3 for k in range(4)]
+                cs = [(c[0], oc[k][3], oc[k][4], oc[k][5] & 0xFFFFFF) if slots[k] in slots[:k] else c
+                      for k, c in enumerate(cs)]
                 per = [cs[0], cs[1], cs[3], cs[2]]
                 if _dot(_newell([c[0] for c in per]), _newell([c[0] for c in rev])) < 0:
                     # winding no longer matches the Blender face (flipped normals, mirrored object)
@@ -390,6 +395,10 @@ def build_bsp(objs, data, depsgraph, warn=print, coll_obj=None):
         warn("%d faces have edges longer than %d game units (%.1f in Blender); the PS1 may drop them at close "
              "range - subdivide them" % (big, MAX_EDGE, MAX_EDGE / 100.0))
 
+    # Degenerate original polygons are never imported (no area); keep them as they are.
+    for pid, q in enumerate(b.polys):
+        if pid not in used and owner[pid] is not None and len(set(tuple(r[:3]) for r in q.r)) < 3:
+            used.add(pid)
     removed = sum(1 for pid in range(len(b.polys)) if pid not in used and owner[pid] is not None)
 
     if True:                                       # always: also repairs spheres of older exports
@@ -554,7 +563,7 @@ def apply_collision_object(b, obj, depsgraph, nodes):
                 v = struct.unpack_from("<16h", t, o)
                 old = [v[k * 4:k * 4 + 3] for k in range(4)]
                 cur = pts + [pts[-1]] * (4 - len(pts))
-                if sorted(map(tuple, cur)) != sorted(map(tuple, old)):
+                if set(map(tuple, cur)) != set(map(tuple, old)):
                     e = _coll_entry(b, nodes, pts, bn) or (bspmod.collision_quad(pts[::-1], (-bn.x, bn.z, -bn.y), True), set(), False)
                     t[o:o + 32] = e[0][:32]          # corners
                     t[o + 32:o + 40] = e[0][32:40]   # plane
